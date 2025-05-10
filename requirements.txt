@@ -1,9 +1,3 @@
 pinecone
 crewai
 crewai-tools
-serper-dev-tool
-openai
-pinecone-client
-pinecone-pinecone
-pinecone-pinecone-client
-pinecone-pinecone-client-python

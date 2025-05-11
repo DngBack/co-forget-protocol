@@ -1,9 +1,10 @@
 import os
 import time
 import math
-from pinecone import Pinecone
+from pinecone import Pinecone, IndexEmbed
 from crewai import Agent, Crew, Task, Process
-from crewai_tools import BaseTool, SerperDevTool
+from crewai_tools import SerperDevTool
+from crewai.tools.base_tool import BaseTool
 
 # Pinecone Setup
 api_key = os.getenv("PINECONE_API_KEY")
@@ -14,7 +15,7 @@ if not pc.has_index(index_name):
         name=index_name,
         cloud="aws",
         region="us-east-1",
-        embed={"model": "all-MiniLM-L6-v2", "field_map": {"text": "text"}},
+        embed=IndexEmbed(model="all-MiniLM-L6-v2", field_map={"text": "text"}),
     )
 index = pc.Index(index_name)
 
@@ -25,7 +26,7 @@ class PineconeUpsertTool(BaseTool):
     description = "Upsert a memory to Pinecone"
 
     def __init__(self, pc, index_name, namespace):
-        super().__init__()
+        super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.namespace = namespace
@@ -41,7 +42,7 @@ class PineconeRetrieveTool(BaseTool):
     description = "Retrieve similar memories from Pinecone"
 
     def __init__(self, pc, index_name, namespace):
-        super().__init__()
+        super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.namespace = namespace
@@ -58,7 +59,7 @@ class PineconeListMemoriesTool(BaseTool):
     description = "List all memory IDs in Pinecone"
 
     def __init__(self, pc, index_name, namespace):
-        super().__init__()
+        super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.namespace = namespace
@@ -73,7 +74,7 @@ class PineconeFetchMemoriesTool(BaseTool):
     description = "Fetch memories by IDs from Pinecone"
 
     def __init__(self, pc, index_name, namespace):
-        super().__init__()
+        super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.namespace = namespace
@@ -90,7 +91,7 @@ class PineconeProposeRemovalTool(BaseTool):
     description = "Propose a memory for removal"
 
     def __init__(self, pc, index_name, proposals_namespace, agent_id):
-        super().__init__()
+        super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.proposals_namespace = proposals_namespace
@@ -109,7 +110,7 @@ class PineconeRetrieveProposalsTool(BaseTool):
     description = "Retrieve all proposed memories for removal"
 
     def __init__(self, pc, index_name, proposals_namespace):
-        super().__init__()
+        super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.proposals_namespace = proposals_namespace
@@ -127,7 +128,7 @@ class PineconeDeleteMemoriesTool(BaseTool):
     description = "Delete specified memories from Pinecone"
 
     def __init__(self, pc, index_name, namespace):
-        super().__init__()
+        super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.namespace = namespace

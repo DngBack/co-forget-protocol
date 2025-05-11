@@ -1,3 +1,7 @@
-pinecone
-crewai
-crewai-tools
+pinecone-client>=3.0.0
+crewai>=0.11.0
+crewai-tools>=0.0.3
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+loguru>=0.7.2
+typing-extensions>=4.8.0

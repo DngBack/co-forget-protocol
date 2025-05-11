@@ -1,10 +1,68 @@
 import os
 import time
 import math
+import asyncio
+import logging
+from typing import Sequence, List, Dict, Optional, Union, Any
+from datetime import datetime
 from pinecone import Pinecone, IndexEmbed
 from crewai import Agent, Crew, Task, Process
-from crewai_tools import SerperDevTool
+from crewai.agent import BaseAgent
 from crewai.tools.base_tool import BaseTool
+from crewai_tools import SerperDevTool
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+# Memory Management Classes
+class MemoryQuota:
+    def __init__(self, max_memories: int):
+        self.max_memories = max_memories
+        self.current_count = 0
+
+    def can_add_memory(self) -> bool:
+        return self.current_count < self.max_memories
+
+    def increment(self):
+        self.current_count += 1
+
+    def decrement(self):
+        self.current_count = max(0, self.current_count - 1)
+
+
+class MemoryScorer:
+    @staticmethod
+    def calculate_score(timestamp: float, importance: float = 1.0) -> float:
+        time_decay = math.exp(-(time.time() - timestamp) / 10)
+        return time_decay * importance
+
+    @staticmethod
+    def should_remove(score: float, threshold: float = 0.3) -> bool:
+        return score < threshold
+
+
+class MemoryBatch:
+    def __init__(self, batch_size: int = 100):
+        self.batch_size = batch_size
+        self.records: List[dict] = []
+
+    def add(self, text: str, metadata: dict):
+        self.records.append({"text": text, "metadata": metadata})
+        if len(self.records) >= self.batch_size:
+            return self.flush()
+        return None
+
+    def flush(self) -> List[dict]:
+        if not self.records:
+            return []
+        records = self.records.copy()
+        self.records.clear()
+        return records
+
 
 # Pinecone Setup
 api_key = os.getenv("PINECONE_API_KEY")
@@ -25,16 +83,46 @@ class PineconeUpsertTool(BaseTool):
     name = "Pinecone Upsert"
     description = "Upsert a memory to Pinecone"
 
-    def __init__(self, pc, index_name, namespace):
+    def __init__(self, pc, index_name, namespace, quota: Optional[MemoryQuota] = None):
         super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.namespace = namespace
+        self.quota = quota or MemoryQuota(max_memories=10000)
+        self.batch = MemoryBatch()
 
     def _run(self, text: str, metadata: dict) -> str:
-        record = {"text": text, "metadata": metadata}
-        self.index.upsert_records(self.namespace, [record])
-        return "Memory upserted"
+        if not self.quota.can_add_memory():
+            logger.warning(f"Memory quota exceeded in namespace {self.namespace}")
+            return "Memory quota exceeded"
+
+        try:
+            # Add timestamp if not present
+            if "timestamp" not in metadata:
+                metadata["timestamp"] = time.time()
+
+            # Add to batch
+            records = self.batch.add(text, metadata)
+            if records:
+                self.index.upsert_records(self.namespace, records)
+                self.quota.increment()
+                logger.info(
+                    f"Batch upserted {len(records)} memories to {self.namespace}"
+                )
+
+            return "Memory queued for upsert"
+        except Exception as e:
+            logger.error(f"Error upserting memory: {str(e)}")
+            raise
+
+    def flush(self) -> str:
+        """Force flush any remaining records in the batch"""
+        records = self.batch.flush()
+        if records:
+            self.index.upsert_records(self.namespace, records)
+            self.quota.increment()
+            logger.info(f"Flushed {len(records)} memories to {self.namespace}")
+        return f"Flushed {len(records)} memories"
 
 
 class PineconeRetrieveTool(BaseTool):
@@ -47,11 +135,36 @@ class PineconeRetrieveTool(BaseTool):
         self.index = pc.Index(index_name)
         self.namespace = namespace
 
-    def _run(self, query: str, top_k: int = 5) -> list:
-        results = self.index.search(
-            self.namespace, {"top_k": top_k, "inputs": {"text": query}}
-        )
-        return results.get("matches", [])
+    def _run(self, query: str, top_k: int = 5, min_score: float = 0.7) -> list:
+        try:
+            results = self.index.search(
+                self.namespace,
+                {
+                    "top_k": top_k,
+                    "inputs": {"text": query},
+                    "score_threshold": min_score,
+                },
+            )
+            matches = results.get("matches", [])
+
+            # Score and filter memories
+            current_time = time.time()
+            scored_matches = []
+            for match in matches:
+                metadata = match.get("metadata", {})
+                timestamp = metadata.get("timestamp", current_time)
+                score = MemoryScorer.calculate_score(timestamp)
+
+                if not MemoryScorer.should_remove(score):
+                    scored_matches.append({**match, "memory_score": score})
+
+            logger.info(
+                f"Retrieved {len(scored_matches)} memories from {self.namespace}"
+            )
+            return scored_matches
+        except Exception as e:
+            logger.error(f"Error retrieving memories: {str(e)}")
+            raise
 
 
 class PineconeListMemoriesTool(BaseTool):
@@ -96,13 +209,40 @@ class PineconeProposeRemovalTool(BaseTool):
         self.index = pc.Index(index_name)
         self.proposals_namespace = proposals_namespace
         self.agent_id = agent_id
+        self.batch = MemoryBatch()
 
-    def _run(self, memory_id: str) -> str:
-        text = "proposal"
-        metadata = {"memory_id": memory_id, "agent_id": self.agent_id}
-        record = {"text": text, "metadata": metadata}
-        self.index.upsert_records(self.proposals_namespace, [record])
-        return f"Proposed to remove memory {memory_id}"
+    async def _run_async(self, memory_id: str, score: float) -> str:
+        try:
+            text = "proposal"
+            metadata = {
+                "memory_id": memory_id,
+                "agent_id": self.agent_id,
+                "score": score,
+                "timestamp": time.time(),
+            }
+            records = self.batch.add(text, metadata)
+            if records:
+                await asyncio.to_thread(
+                    self.index.upsert_records, self.proposals_namespace, records
+                )
+                logger.info(
+                    f"Proposed removal of memory {memory_id} with score {score}"
+                )
+            return f"Proposed to remove memory {memory_id}"
+        except Exception as e:
+            logger.error(f"Error proposing removal: {str(e)}")
+            raise
+
+    def _run(self, memory_id: str, score: float) -> str:
+        return asyncio.run(self._run_async(memory_id, score))
+
+    async def flush_async(self) -> str:
+        records = self.batch.flush()
+        if records:
+            await asyncio.to_thread(
+                self.index.upsert_records, self.proposals_namespace, records
+            )
+        return f"Flushed {len(records)} proposals"
 
 
 class PineconeRetrieveProposalsTool(BaseTool):
@@ -115,31 +255,81 @@ class PineconeRetrieveProposalsTool(BaseTool):
         self.index = pc.Index(index_name)
         self.proposals_namespace = proposals_namespace
 
-    def _run(self) -> list:
-        ids = self.index.list(namespace=self.proposals_namespace)
-        if not ids:
-            return []
-        vectors = self.index.fetch(ids=ids, namespace=self.proposals_namespace)
-        return [vec["metadata"] for vec in vectors.get("vectors", {}).values()]
+    async def _run_async(self) -> List[Dict]:
+        try:
+            ids = await asyncio.to_thread(
+                self.index.list, namespace=self.proposals_namespace
+            )
+            if not ids:
+                return []
+
+            vectors = await asyncio.to_thread(
+                self.index.fetch, ids=ids, namespace=self.proposals_namespace
+            )
+
+            proposals = []
+            for vec in vectors.get("vectors", {}).values():
+                metadata = vec.get("metadata", {})
+                # Group proposals by memory_id
+                memory_id = metadata.get("memory_id")
+                if memory_id:
+                    proposals.append(
+                        {
+                            "memory_id": memory_id,
+                            "agent_id": metadata.get("agent_id"),
+                            "score": metadata.get("score", 0),
+                            "timestamp": metadata.get("timestamp", 0),
+                        }
+                    )
+
+            logger.info(f"Retrieved {len(proposals)} proposals")
+            return proposals
+        except Exception as e:
+            logger.error(f"Error retrieving proposals: {str(e)}")
+            raise
+
+    def _run(self) -> List[Dict]:
+        return asyncio.run(self._run_async())
 
 
 class PineconeDeleteMemoriesTool(BaseTool):
     name = "Pinecone Delete Memories"
     description = "Delete specified memories from Pinecone"
 
-    def __init__(self, pc, index_name, namespace):
+    def __init__(self, pc, index_name, namespace, quota: Optional[MemoryQuota] = None):
         super().__init__(name=self.name, description=self.description)
         self.pc = pc
         self.index = pc.Index(index_name)
         self.namespace = namespace
+        self.quota = quota
 
-    def _run(self, memory_ids: list) -> str:
-        if memory_ids:
-            self.index.delete(ids=memory_ids, namespace=self.namespace)
-        return f"Deleted memories: {memory_ids}"
+    async def _run_async(self, memory_ids: List[str]) -> str:
+        if not memory_ids:
+            return "No memories to delete"
+
+        try:
+            await asyncio.to_thread(
+                self.index.delete, ids=memory_ids, namespace=self.namespace
+            )
+
+            if self.quota:
+                for _ in memory_ids:
+                    self.quota.decrement()
+
+            logger.info(f"Deleted {len(memory_ids)} memories from {self.namespace}")
+            return f"Deleted memories: {memory_ids}"
+        except Exception as e:
+            logger.error(f"Error deleting memories: {str(e)}")
+            raise
+
+    def _run(self, memory_ids: List[str]) -> str:
+        return asyncio.run(self._run_async(memory_ids))
 
 
 # Agents
+memory_quota = MemoryQuota(max_memories=10000)
+baseline_quota = MemoryQuota(max_memories=10000)
+
 memory_managers = [
     Agent(
         role="Memory Manager",
@@ -160,7 +350,7 @@ task_performer = Agent(
     goal="Answer questions using shared memory or web search",
     backstory="You excel at using shared knowledge to answer queries.",
     tools=[
-        PineconeUpsertTool(pc, index_name, "memories"),
+        PineconeUpsertTool(pc, index_name, "memories", quota=memory_quota),
         PineconeRetrieveTool(pc, index_name, "memories"),
         SerperDevTool(),
     ],
@@ -173,7 +363,7 @@ coordinator = Agent(
     backstory="You oversee efficient memory management.",
     tools=[
         PineconeRetrieveProposalsTool(pc, index_name, "proposals"),
-        PineconeDeleteMemoriesTool(pc, index_name, "memories"),
+        PineconeDeleteMemoriesTool(pc, index_name, "memories", quota=memory_quota),
         PineconeDeleteMemoriesTool(pc, index_name, "proposals"),
     ],
     verbose=True,
@@ -204,11 +394,13 @@ baseline_agent = Agent(
     goal="Answer questions and manage memory independently",
     backstory="You operate without collaborative pruning.",
     tools=[
-        PineconeUpsertTool(pc, index_name, "baseline_memories"),
+        PineconeUpsertTool(pc, index_name, "baseline_memories", quota=baseline_quota),
         PineconeRetrieveTool(pc, index_name, "baseline_memories"),
         PineconeListMemoriesTool(pc, index_name, "baseline_memories"),
         PineconeFetchMemoriesTool(pc, index_name, "baseline_memories"),
-        PineconeDeleteMemoriesTool(pc, index_name, "baseline_memories"),
+        PineconeDeleteMemoriesTool(
+            pc, index_name, "baseline_memories", quota=baseline_quota
+        ),
         SerperDevTool(),
     ],
     verbose=True,
@@ -222,94 +414,94 @@ baseline_question_task = Task(
 
 
 # Main Execution
-def main():
+async def process_question(
+    question: str, agent: BaseAgent, is_baseline: bool = False
+) -> Any:
+    crew = Crew(
+        agents=[agent],
+        tasks=[
+            Task(
+                description=f"Answer: {question}",
+                agent=agent,
+                expected_output="A concise answer",
+            )
+        ],
+        process=Process.sequential,
+    )
+    result = await asyncio.to_thread(crew.kickoff)
+    return str(result)  # Convert CrewOutput to string
+
+
+async def prune_memories(agents: Sequence[BaseAgent], coordinator: BaseAgent):
+    # Get proposals from all memory managers
+    propose_tasks = []
+    for agent in agents:
+        if isinstance(agent, Agent) and agent.role == "Memory Manager":
+            task = Task(
+                description=propose_task.description,
+                agent=agent,
+                expected_output=propose_task.expected_output,
+            )
+            propose_tasks.append(task)
+
+    # Execute proposals and coordination
+    pruning_crew = Crew(
+        agents=list(agents) + [coordinator],
+        tasks=propose_tasks + [coordinate_task],
+        process=Process.sequential,
+    )
+    await asyncio.to_thread(pruning_crew.kickoff)
+
+
+async def main_async():
     questions = ["Who is the CEO of Tesla?", "What is the capital of France?"]
     protocol_answers = []
     baseline_answers = []
-    protocol_memory_count = 0
-    baseline_memory_count = 0
 
     for i, question in enumerate(questions):
-        # Protocol execution
-        crew = Crew(
-            agents=[task_performer],
-            tasks=[
-                Task(
-                    description=f"Answer: {question}",
-                    agent=task_performer,
-                    expected_output="A concise answer",
-                )
-            ],
-            process=Process.sequential,
+        # Process questions concurrently
+        protocol_answer, baseline_answer = await asyncio.gather(
+            process_question(question, task_performer),
+            process_question(question, baseline_agent, is_baseline=True),
         )
-        answer = crew.kickoff()
-        protocol_answers.append(answer)
 
-        # Baseline execution
-        baseline_crew = Crew(
-            agents=[baseline_agent],
-            tasks=[
-                Task(
-                    description=f"Answer: {question}",
-                    agent=baseline_agent,
-                    expected_output="A concise answer",
-                )
-            ],
-            process=Process.sequential,
-        )
-        baseline_answer = baseline_crew.kickoff()
+        protocol_answers.append(protocol_answer)
         baseline_answers.append(baseline_answer)
 
-        # Pruning after every 2 questions
+        # Prune after every 2 questions
         if (i + 1) % 2 == 0:
-            # Protocol pruning
-            propose_tasks = [
-                Task(
-                    description=propose_task.description,
-                    agent=agent,
-                    expected_output=propose_task.expected_output,
-                )
-                for agent in memory_managers
-            ]
-            pruning_crew = Crew(
-                agents=memory_managers + [coordinator],
-                tasks=propose_tasks + [coordinate_task],
-                process=Process.sequential,
+            await asyncio.gather(
+                prune_memories(memory_managers, coordinator),
+                process_question(
+                    "", baseline_agent, is_baseline=True
+                ),  # Baseline pruning
             )
-            pruning_crew.kickoff()
 
-            # Baseline pruning
-            baseline_prune_task = Task(
-                description="List memories, calculate D(t) = exp(-(current_time - timestamp) / 10), delete those with D(t) < 0.3.",
-                agent=baseline_agent,
-                expected_output="List of deleted memory IDs",
+            # Update memory counts
+            protocol_stats = await asyncio.to_thread(index.describe_index_stats)
+            baseline_stats = await asyncio.to_thread(index.describe_index_stats)
+
+            protocol_memory_count = (
+                protocol_stats.get("namespaces", {})
+                .get("memories", {})
+                .get("vector_count", 0)
             )
-            baseline_crew = Crew(
-                agents=[baseline_agent],
-                tasks=[baseline_prune_task],
-                process=Process.sequential,
+            baseline_memory_count = (
+                baseline_stats.get("namespaces", {})
+                .get("baseline_memories", {})
+                .get("vector_count", 0)
             )
-            baseline_crew.kickoff()
 
-        # Update memory counts
-        protocol_stats = index.describe_index_stats()
-        baseline_stats = index.describe_index_stats()
-        protocol_memory_count = (
-            protocol_stats.get("namespaces", {})
-            .get("memories", {})
-            .get("vector_count", 0)
-        )
-        baseline_memory_count = (
-            baseline_stats.get("namespaces", {})
-            .get("baseline_memories", {})
-            .get("vector_count", 0)
-        )
+            logger.info(f"Protocol Memory Count: {protocol_memory_count}")
+            logger.info(f"Baseline Memory Count: {baseline_memory_count}")
 
-    # Output results
+    return protocol_answers, baseline_answers
+
+
+def main():
+    protocol_answers, baseline_answers = asyncio.run(main_async())
     print("Protocol Answers:", protocol_answers)
     print("Baseline Answers:", baseline_answers)
-    print(f"Protocol Memory Count: {protocol_memory_count}")
-    print(f"Baseline Memory Count: {baseline_memory_count}")
 
 
 if __name__ == "__main__":

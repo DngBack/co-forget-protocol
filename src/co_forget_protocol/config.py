@@ -1,4 +1,4 @@
-"""Configuration settings for the Co-Forget Protocol."""
+"""Configuration classes for the Co-Forget Protocol."""
 
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -6,14 +6,11 @@ from pydantic_settings import BaseSettings
 
 
 class PineconeConfig(BaseModel):
-    """Pinecone configuration settings."""
+    """Pinecone configuration."""
 
-    api_key: str = Field(default="", env="PINECONE_API_KEY")
-    index_name: str = "co-forgetting-index"
-    cloud: str = "aws"
-    region: str = "us-east-1"
-    model: str = "all-MiniLM-L6-v2"
-    field_map: dict = {"text": "text"}
+    api_key: str
+    environment: str = "us-west1-gcp"
+    index_name: str = "memories"
 
 
 class MemoryConfig(BaseModel):
@@ -23,21 +20,28 @@ class MemoryConfig(BaseModel):
     batch_size: int = 100
     decay_factor: float = 10.0
     removal_threshold: float = 0.3
+    cache_size: int = 100
+    cache_ttl: int = 3600  # 1 hour
 
 
 class AgentConfig(BaseModel):
-    """Agent configuration settings."""
+    """Agent configuration."""
 
     num_memory_managers: int = 3
     verbose: bool = True
+    llm_model: str = "distilbert-base-uncased"
+    relevance_threshold: float = 0.7
+    max_faulty: int = Field(
+        default=1, description="Maximum number of faulty agents allowed"
+    )
 
 
 class Settings(BaseSettings):
-    """Main settings for the Co-Forget Protocol."""
+    """Global settings for the protocol."""
 
-    pinecone: PineconeConfig = Field(default_factory=PineconeConfig)
-    memory: MemoryConfig = Field(default_factory=MemoryConfig)
-    agent: AgentConfig = Field(default_factory=AgentConfig)
+    pinecone: PineconeConfig
+    memory: MemoryConfig = MemoryConfig()
+    agent: AgentConfig = AgentConfig()
     log_level: str = "INFO"
 
     class Config:

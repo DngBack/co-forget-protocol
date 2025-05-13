@@ -3,5 +3,15 @@ crewai>=0.11.0
 crewai-tools>=0.0.3
 python-dotenv>=1.0.0
 pydantic>=2.5.0
-loguru>=0.7.2
+loguru>=0.7.0
 typing-extensions>=4.8.0
+sqlite3
+grpcio>=1.54.0
+grpcio-tools>=1.54.0
+cachetools>=5.3.0
+transformers>=4.30.0
+torch>=2.0.0
+numpy>=1.24.0
+protobuf>=4.23.0
+pytest 
+pytest-asyncio

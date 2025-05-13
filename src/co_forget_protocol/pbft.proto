@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package co_forget_protocol;
+
+service PBFTService {
+    rpc ProposeForgetting (ProposeRequest) returns (ProposeResponse);
+    rpc VoteOnMemory (VoteRequest) returns (VoteResponse);
+    rpc Commit (CommitRequest) returns (CommitResponse);
+}
+
+message ProposeRequest {
+    repeated string memory_ids = 1;
+}
+
+message ProposeResponse {
+    repeated string proposal_ids = 1;
+}
+
+message VoteRequest {
+    string memory_id = 1;
+}
+
+message VoteResponse {
+    string vote = 1;  // "forget" or "keep"
+}
+
+message CommitRequest {
+    repeated string memory_ids = 1;
+}
+
+message CommitResponse {
+    bool success = 1;
+} 

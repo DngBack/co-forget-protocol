@@ -1,14 +1,16 @@
 """Main execution module for the Co-Forget Protocol."""
 
 import asyncio
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 from loguru import logger
 from crewai import Crew, Process, Task
 
 from .config import Settings
-from .memory import MemoryQuota
+from .memory import MemoryQuota, MemoryManager
 from .pinecone import PineconeManager
 from .agents import create_agents, create_tasks, AgentDict
+from .pbft import PBFTCoordinator, PBFTService
+from .voting import LLMVoter
 
 
 class Protocol:
@@ -20,11 +22,36 @@ class Protocol:
         self.pinecone = PineconeManager(self.settings.pinecone)
         self.memory_quota = MemoryQuota(self.settings.memory.max_memories)
         self.baseline_quota = MemoryQuota(self.settings.memory.max_memories)
+
+        # Initialize memory managers with SQLite and caching
+        self.memory_managers = [
+            MemoryManager(
+                db_path=f"memories_{i}.db",
+                cache_size=self.settings.memory.cache_size,
+                batch_size=self.settings.memory.batch_size,
+            )
+            for i in range(self.settings.agent.num_memory_managers)
+        ]
+
+        # Initialize LLM voter
+        self.voter = LLMVoter(
+            model_name=self.settings.agent.llm_model,
+            relevance_threshold=self.settings.agent.relevance_threshold,
+        )
+
+        # Initialize PBFT coordinator
+        self.pbft_coordinator = PBFTCoordinator(
+            num_agents=self.settings.agent.num_memory_managers,
+            max_faulty=self.settings.agent.max_faulty,
+        )
+
+        # Create agents with new components
         self.agents = create_agents(
             self.pinecone,
             self.memory_quota,
             self.baseline_quota,
-            self.settings.agent.num_memory_managers,
+            self.memory_managers,
+            self.voter,
             self.settings.agent.verbose,
         )
         self.tasks = create_tasks(self.agents)
@@ -48,24 +75,28 @@ class Protocol:
         return str(result)
 
     async def prune_memories(self) -> None:
-        """Prune memories using the protocol."""
-        # Get proposals from all memory managers
-        propose_tasks = []
-        for agent in self.agents["memory_managers"]:
-            task = Task(
-                description=self.tasks["propose"].description,
-                agent=agent,
-                expected_output=self.tasks["propose"].expected_output,
-            )
-            propose_tasks.append(task)
+        """Prune memories using PBFT consensus."""
+        # Get all memory IDs
+        memory_ids: Set[str] = set()
+        for manager in self.memory_managers:
+            memory_ids.update(manager.get_all_memory_ids())
 
-        # Execute proposals and coordination
-        pruning_crew = Crew(
-            agents=list(self.agents["memory_managers"]) + [self.agents["coordinator"]],
-            tasks=propose_tasks + [self.tasks["coordinate"]],
-            process=Process.sequential,
+        # Run PBFT consensus
+        to_delete = await self.pbft_coordinator.run_consensus(
+            memory_ids, [manager.agent_id for manager in self.memory_managers]
         )
-        await asyncio.to_thread(pruning_crew.kickoff)
+
+        # Delete memories that reached consensus
+        for memory_id in to_delete:
+            for manager in self.memory_managers:
+                manager.delete_memory(memory_id)
+            self.memory_quota.decrement()
+
+        # Flush any pending batch operations
+        for manager in self.memory_managers:
+            manager.flush()
+
+        logger.info(f"Deleted {len(to_delete)} memories through consensus")
 
     async def run(
         self, questions: List[str], prune_interval: int = 2
